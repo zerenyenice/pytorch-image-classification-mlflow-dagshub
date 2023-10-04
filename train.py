@@ -349,6 +349,7 @@ def main(args):
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    target_metric = torchmetrics.F1Score(type='multiclass', num_classes=num_classes, average='macro')
 
     custom_keys_weight_decay = []
     if args.bias_weight_decay is not None:
@@ -462,7 +463,7 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler)
+        train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler, target_metric)
         lr_scheduler.step()
         evaluate(model, criterion, data_loader_test, device=device)
         if model_ema:
