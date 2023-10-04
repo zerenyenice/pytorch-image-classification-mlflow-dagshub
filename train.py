@@ -29,70 +29,69 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
 
     num_processed_samples = 0
     header = f"Epoch: [{epoch}]"
-    with mlflow.start_run() as run:
-        for i, (image, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
-            start_time = time.time()
-            image, target = image.to(device), target.to(device)
-            with torch.cuda.amp.autocast(enabled=scaler is not None):
-                output = model(image)
-                loss = criterion(output, target)
+    for i, (image, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
+        start_time = time.time()
+        image, target = image.to(device), target.to(device)
+        with torch.cuda.amp.autocast(enabled=scaler is not None):
+            output = model(image)
+            loss = criterion(output, target)
 
-            optimizer.zero_grad()
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                if args.clip_grad_norm is not None:
-                    # we should unscale the gradients of optimizer's assigned params if do gradient clipping
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                if args.clip_grad_norm is not None:
-                    nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-                optimizer.step()
+        optimizer.zero_grad()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            if args.clip_grad_norm is not None:
+                # we should unscale the gradients of optimizer's assigned params if do gradient clipping
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if args.clip_grad_norm is not None:
+                nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+            optimizer.step()
 
-            if model_ema and i % args.model_ema_steps == 0:
-                model_ema.update_parameters(model)
-                if epoch < args.lr_warmup_epochs:
-                    # Reset ema buffer to keep copying weights during warmup period
-                    model_ema.n_averaged.fill_(0)
+        if model_ema and i % args.model_ema_steps == 0:
+            model_ema.update_parameters(model)
+            if epoch < args.lr_warmup_epochs:
+                # Reset ema buffer to keep copying weights during warmup period
+                model_ema.n_averaged.fill_(0)
 
-            acc1, acc3 = utils.accuracy(output, target, topk=(1, 3))
+        acc1, acc3 = utils.accuracy(output, target, topk=(1, 3))
 
-            if target_metric:
-                target_metric.update(output.max(dim=-1)[1].cpu(), target.max(dim=-1)[1].cpu())
+        if target_metric:
+            target_metric.update(output.max(dim=-1)[1].cpu(), target.max(dim=-1)[1].cpu())
 
-            batch_size = image.shape[0]
-            metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
-            metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
-            metric_logger.meters["img/s"].update(batch_size / (time.time() - start_time))
+        batch_size = image.shape[0]
+        metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
+        metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
+        metric_logger.meters["img/s"].update(batch_size / (time.time() - start_time))
 
-            num_processed_samples += batch_size
+        num_processed_samples += batch_size
 
-        num_processed_samples = utils.reduce_across_processes(num_processed_samples)
-        if (
-                hasattr(data_loader.dataset, "__len__")
-                and len(data_loader.dataset) != num_processed_samples
-                and torch.distributed.get_rank() == 0
-        ):
-            # See FIXME above
-            warnings.warn(
-                f"It looks like the dataset has {len(data_loader.dataset)} samples, but {num_processed_samples} "
-                "samples were used for the validation, which might bias the results. "
-                "Try adjusting the batch size and / or the world size. "
-                "Setting the world size to 1 is always a safe bet."
-            )
+    num_processed_samples = utils.reduce_across_processes(num_processed_samples)
+    if (
+            hasattr(data_loader.dataset, "__len__")
+            and len(data_loader.dataset) != num_processed_samples
+            and torch.distributed.get_rank() == 0
+    ):
+        # See FIXME above
+        warnings.warn(
+            f"It looks like the dataset has {len(data_loader.dataset)} samples, but {num_processed_samples} "
+            "samples were used for the validation, which might bias the results. "
+            "Try adjusting the batch size and / or the world size. "
+            "Setting the world size to 1 is always a safe bet."
+        )
 
-        metric_logger.synchronize_between_processes()
-        avg_loss = metric_logger.loss.global_avg
-        avg_acc1 = metric_logger.acc1.global_avg
-        f1_score = float(target_metric.compute().cpu())
+    metric_logger.synchronize_between_processes()
+    avg_loss = metric_logger.loss.global_avg
+    avg_acc1 = metric_logger.acc1.global_avg
+    f1_score = float(target_metric.compute().cpu())
 
-        print(f"{header} Training: Loss: {avg_loss:.3f} Acc: {avg_acc1:.3f} F1: {f1_score:.3f}")
-        log_scalar("train_loss", avg_loss, epoch)
-        log_scalar("train_acc", avg_acc1, epoch)
-        log_scalar("train_f1", f1_score, epoch)
+    print(f"{header} Training: Loss: {avg_loss:.3f} Acc: {avg_acc1:.3f} F1: {f1_score:.3f}")
+    log_scalar("train_loss", avg_loss, epoch)
+    log_scalar("train_acc", avg_acc1, epoch)
+    log_scalar("train_f1", f1_score, epoch)
 
 
 def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix=""):
