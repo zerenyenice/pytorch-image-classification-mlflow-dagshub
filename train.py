@@ -86,7 +86,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
     metric_logger.synchronize_between_processes()
     avg_loss = metric_logger.loss.global_avg
     avg_acc1 = metric_logger.acc1.global_avg
-    f1_score = target_metric.compute().cpu()
+    f1_score = target_metric.compute().item() if target_metric else 0.0
 
     print(f"{header} Training: Loss: {avg_loss:.3f} Acc: {avg_acc1:.3f} F1: {f1_score:.3f}")
     log_scalar("train_loss", avg_loss, epoch)
