@@ -60,7 +60,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
         acc1, acc3 = utils.accuracy(output, target, topk=(1, 3))
 
         if target_metric:
-            target_metric.update(output.max(dim=-1)[1].cpu(), target.max(dim=-1)[1].cpu())
+            target_metric.update(output.max(dim=-1)[1], target.max(dim=-1)[1])
 
         batch_size = image.shape[0]
         metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
@@ -86,7 +86,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
     metric_logger.synchronize_between_processes()
     avg_loss = metric_logger.loss.global_avg
     avg_acc1 = metric_logger.acc1.global_avg
-    f1_score = target_metric.compute().item() if target_metric else 0.0
+    f1_score = target_metric.compute().cpu().item() if target_metric else 0.0
 
     print(f"{header} Training: Loss: {avg_loss:.3f} Acc: {avg_acc1:.3f} F1: {f1_score:.3f}")
     log_scalar("train_loss", avg_loss, epoch)
@@ -349,7 +349,7 @@ def main(args):
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-    target_metric = torchmetrics.F1Score(task='multiclass', num_classes=num_classes, average='macro')
+    target_metric = torchmetrics.F1Score(task='multiclass', num_classes=num_classes, average='macro').cuda()
 
     custom_keys_weight_decay = []
     if args.bias_weight_decay is not None:
