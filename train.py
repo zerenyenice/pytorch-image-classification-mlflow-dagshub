@@ -2,7 +2,7 @@ import datetime
 import os
 import time
 import warnings
-
+from dotenv import load_dotenv
 import presets
 import torch
 import torch.utils.data
@@ -15,57 +15,90 @@ from torch.utils.data.dataloader import default_collate
 from torchvision.transforms.functional import InterpolationMode
 from transforms import get_mixup_cutmix
 import torchmetrics
+import mlflow
+
+load_dotenv()
 
 
-def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema=None, scaler=None):
+def train_one_epoch(model, criterion, optimizer, data_loader,
+                    device, epoch, args, model_ema=None, scaler=None, target_metric: torchmetrics.Metric=None):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value}"))
     metric_logger.add_meter("img/s", utils.SmoothedValue(window_size=10, fmt="{value}"))
-    
+
+    num_processed_samples = 0
     header = f"Epoch: [{epoch}]"
-    for i, (image, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
-        start_time = time.time()
-        image, target = image.to(device), target.to(device)
-        with torch.cuda.amp.autocast(enabled=scaler is not None):
-            output = model(image)
-            loss = criterion(output, target)
+    with mlflow.start_run() as run:
+        for i, (image, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
+            start_time = time.time()
+            image, target = image.to(device), target.to(device)
+            with torch.cuda.amp.autocast(enabled=scaler is not None):
+                output = model(image)
+                loss = criterion(output, target)
 
-        optimizer.zero_grad()
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            if args.clip_grad_norm is not None:
-                # we should unscale the gradients of optimizer's assigned params if do gradient clipping
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            if args.clip_grad_norm is not None:
-                nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-            optimizer.step()
+            optimizer.zero_grad()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                if args.clip_grad_norm is not None:
+                    # we should unscale the gradients of optimizer's assigned params if do gradient clipping
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if args.clip_grad_norm is not None:
+                    nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+                optimizer.step()
 
-        if model_ema and i % args.model_ema_steps == 0:
-            model_ema.update_parameters(model)
-            if epoch < args.lr_warmup_epochs:
-                # Reset ema buffer to keep copying weights during warmup period
-                model_ema.n_averaged.fill_(0)
+            if model_ema and i % args.model_ema_steps == 0:
+                model_ema.update_parameters(model)
+                if epoch < args.lr_warmup_epochs:
+                    # Reset ema buffer to keep copying weights during warmup period
+                    model_ema.n_averaged.fill_(0)
 
-        acc1, acc3 = utils.accuracy(output, target, topk=(1, 3))
-        f1 = torchmetrics.functional.f1_score(output.max(dim=-1)[1], target.max(dim=-1)[1],'multiclass',average='macro',num_classes=3)
+            acc1, acc3 = utils.accuracy(output, target, topk=(1, 3))
 
-        batch_size = image.shape[0]
-        metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
-        metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
-        metric_logger.meters["f1"].update(f1, n=batch_size)
-        metric_logger.meters["img/s"].update(batch_size / (time.time() - start_time))
+            if target_metric:
+                target_metric.update(output.max(dim=-1)[1].cpu(), target.max(dim=-1)[1].cpu())
+
+            batch_size = image.shape[0]
+            metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
+            metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
+            metric_logger.meters["img/s"].update(batch_size / (time.time() - start_time))
+
+            num_processed_samples += batch_size
+
+        num_processed_samples = utils.reduce_across_processes(num_processed_samples)
+        if (
+                hasattr(data_loader.dataset, "__len__")
+                and len(data_loader.dataset) != num_processed_samples
+                and torch.distributed.get_rank() == 0
+        ):
+            # See FIXME above
+            warnings.warn(
+                f"It looks like the dataset has {len(data_loader.dataset)} samples, but {num_processed_samples} "
+                "samples were used for the validation, which might bias the results. "
+                "Try adjusting the batch size and / or the world size. "
+                "Setting the world size to 1 is always a safe bet."
+            )
+
+        metric_logger.synchronize_between_processes()
+        avg_loss = metric_logger.loss.global_avg
+        avg_acc1 = metric_logger.acc1.global_avg
+        f1_score = float(target_metric.compute().cpu())
+
+        print(f"{header} Training: Loss: {avg_loss:.3f} Acc: {avg_acc1:.3f} F1: {f1_score:.3f}")
+        log_scalar("train_loss", avg_loss, epoch)
+        log_scalar("train_acc", avg_acc1, epoch)
+        log_scalar("train_f1", f1_score, epoch)
 
 
 def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix=""):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
-    header = f"Test: {log_suffix}"
+    header = f"-- Test: {log_suffix}"
 
     num_processed_samples = 0
     with torch.inference_mode():
@@ -202,8 +235,61 @@ def load_data(traindir, valdir, args):
 
     return dataset, dataset_test, train_sampler, test_sampler
 
+def log_parameters(args, num_classes):
+    # Augmentation
+    mlflow.log_param('use_v2', args.use_v2)
+    mlflow.log_param('mixup_alpha', args.mixup_alpha)
+    mlflow.log_param('cutmix_alpha', args.cutmix_alpha)
+    mlflow.log_param('auto_augment', args.auto_augment)
+    mlflow.log_param('ra_magnitude', args.ra_magnitude)
+    mlflow.log_param('augmix_severity', args.augmix_severity)
+    mlflow.log_param('random_erase', args.random_erase)
+    mlflow.log_param('ra_sampler', args.ra_sampler)
+    mlflow.log_param('ra_reps', args.ra_reps)
+    mlflow.log_param('interpolation', args.interpolation)
+
+    # Model
+    mlflow.log_param('model_type', args.model)
+    mlflow.log_param('num_classes', num_classes)
+    mlflow.log_param('label_smoothing', args.label_smoothing)
+    mlflow.log_param('sync-bn', args.sync_bn)
+    mlflow.log_param('model_ema', args.model_ema)
+    mlflow.log_param('model_ema_steps', args.model_ema_steps)
+    mlflow.log_param('model_ema_decay', args.model_ema_decay)
+    mlflow.log_param('use_deterministic_algorithms', args.use_deterministic_algorithms)
+    mlflow.log_param('val_resize_size', args.val_resize_size)
+    mlflow.log_param('val_crop_size', args.val_crop_size)
+    mlflow.log_param('train_crop_size', args.train_crop_size)
+    mlflow.log_param('weights', args.weights)
+
+    # Optimizer
+    mlflow.log_param('optimizer', args.opt)
+    mlflow.log_param('lr', args.lr)
+    mlflow.log_param('momentum', args.momentum)
+    mlflow.log_param('weight_decay', args.weight_decay)
+    mlflow.log_param('norm_weight_decay', args.norm_weight_decay)
+    mlflow.log_param('bias_weight_decay', args.bias_weight_decay)
+    mlflow.log_param('transformer_embedding_decay', args.transformer_embedding_decay)
+    mlflow.log_param('clip_grad_norm', args.clip_grad_norm)
+    mlflow.log_param('lr_scheduler', args.lr_scheduler)
+    mlflow.log_param('lr_warmup_epochs', args.lr_warmup_epochs)
+    mlflow.log_param('lr_warmup_method', args.lr_warmup_method)
+    mlflow.log_param('lr_warmup_decay', args.lr_warmup_decay)
+    mlflow.log_param('lr_step_size', args.lr_step_size)
+    mlflow.log_param('lr_gamma', args.lr_gamma)
+    mlflow.log_param('lr_min', args.lr_min)
+    mlflow.log_param('amp', args.amp)
+
+
+def log_scalar(name, value, step):
+    mlflow.log_metric(name, value, step=step)
+
 
 def main(args):
+    remote_server_uri = os.getenv("MLFLOW_TRACKING_URI")
+    mlflow.set_tracking_uri(remote_server_uri)
+    mlflow.set_experiment(f"classification_{args.model}")
+
     if args.output_dir:
         utils.mkdir(args.output_dir)
 
@@ -226,6 +312,9 @@ def main(args):
     mixup_cutmix = get_mixup_cutmix(
         mixup_alpha=args.mixup_alpha, cutmix_alpha=args.cutmix_alpha, num_categories=num_classes, use_v2=args.use_v2
     )
+
+    log_parameters(args, num_classes)
+
     if mixup_cutmix is not None:
 
         def collate_fn(batch):
@@ -253,6 +342,8 @@ def main(args):
     num_ftrs = model.heads.head.in_features
 
     model.heads.head = nn.Linear(num_ftrs, num_classes)
+
+    mlflow.pytorch.log_model(model, "models")
     model.to(device)
 
     if args.distributed and args.sync_bn:
@@ -456,7 +547,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--lr-step-size", default=30, type=int, help="decrease lr every step-size epochs")
     parser.add_argument("--lr-gamma", default=0.1, type=float, help="decrease lr by a factor of lr-gamma")
     parser.add_argument("--lr-min", default=0.0, type=float, help="minimum lr of lr schedule (default: 0.0)")
-    parser.add_argument("--print-freq", default=10, type=int, help="print frequency")
+    parser.add_argument("--print-freq", default=25, type=int, help="print frequency")
     parser.add_argument("--output-dir", default=".", type=str, help="path to save outputs")
     parser.add_argument("--resume", default="", type=str, help="path of checkpoint")
     parser.add_argument("--start-epoch", default=0, type=int, metavar="N", help="start epoch")
