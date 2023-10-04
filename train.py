@@ -349,7 +349,7 @@ def main(args):
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-    target_metric = torchmetrics.F1Score(type='multiclass', num_classes=num_classes, average='macro')
+    target_metric = torchmetrics.F1Score(task='multiclass', num_classes=num_classes, average='macro')
 
     custom_keys_weight_decay = []
     if args.bias_weight_decay is not None:
