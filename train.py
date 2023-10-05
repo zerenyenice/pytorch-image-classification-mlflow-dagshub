@@ -67,34 +67,20 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
         metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
         metric_logger.meters["img/s"].update(batch_size / (time.time() - start_time))
 
-        num_processed_samples += batch_size
-
-    num_processed_samples = utils.reduce_across_processes(num_processed_samples)
-    if (
-            hasattr(data_loader.dataset, "__len__")
-            and len(data_loader.dataset) != num_processed_samples
-            and torch.distributed.get_rank() == 0
-    ):
-        # See FIXME above
-        warnings.warn(
-            f"It looks like the dataset has {len(data_loader.dataset)} samples, but {num_processed_samples} "
-            "samples were used for the validation, which might bias the results. "
-            "Try adjusting the batch size and / or the world size. "
-            "Setting the world size to 1 is always a safe bet."
-        )
-
     metric_logger.synchronize_between_processes()
     avg_loss = metric_logger.loss.global_avg
     avg_acc1 = metric_logger.acc1.global_avg
     f1_score = target_metric.compute().cpu().item() if target_metric else 0.0
 
     print(f"{header} Training: Loss: {avg_loss:.3f} Acc: {avg_acc1:.3f} F1: {f1_score:.3f}")
+    target_metric.reset()
     log_scalar("train_loss", avg_loss, epoch)
     log_scalar("train_acc", avg_acc1, epoch)
     log_scalar("train_f1", f1_score, epoch)
 
 
-def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix=""):
+def evaluate(model, criterion, data_loader, device, epoch, print_freq=100, log_suffix="",
+             target_metric: torchmetrics.Metric=None, EarlyStopping=None):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = f"-- Test: {log_suffix}"
@@ -108,13 +94,13 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix="
             loss = criterion(output, target)
 
             acc1, acc3 = utils.accuracy(output, target, topk=(1, 3))
+            if target_metric:
+                target_metric.update(output.max(dim=-1)[1], target)
             # FIXME need to take into account that the datasets
             # could have been padded in distributed setup
-            f1 = torchmetrics.functional.f1_score(output.max(dim=-1)[1], target, 'multiclass', average='macro', num_classes=3)
             batch_size = image.shape[0]
             metric_logger.update(loss=loss.item())
             metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
-            metric_logger.meters["f1"].update(f1, n=batch_size)
             num_processed_samples += batch_size
     # gather the stats from all processes
 
@@ -131,10 +117,19 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix="
             "Try adjusting the batch size and / or the world size. "
             "Setting the world size to 1 is always a safe bet."
         )
-
+    f1_score = target_metric.compute().cpu().item() if target_metric else 0.0
+    avg_loss = metric_logger.loss.global_avg
+    avg_acc1 = metric_logger.acc1.global_avg
     metric_logger.synchronize_between_processes()
 
-    print(f"{header} Acc@1 {metric_logger.acc1.global_avg:.3f} F1 {metric_logger.f1.global_avg:.3f}")
+    print(f"{header} Acc@1 {avg_acc1:.3f} F1 {f1_score:.3f}")
+    target_metric.reset()
+    log_scalar("test_loss", avg_loss, epoch)
+    log_scalar("test_acc", avg_acc1, epoch)
+    log_scalar("test_f1", f1_score, epoch)
+
+    if EarlyStopping:
+        EarlyStopping(f1_score, model)
     return metric_logger.f1.global_avg
 
 
@@ -288,6 +283,9 @@ def main(args):
     remote_server_uri = os.getenv("MLFLOW_TRACKING_URI")
     mlflow.set_tracking_uri(remote_server_uri)
     mlflow.set_experiment(f"classification_{args.model}")
+
+    #Early Stop and Best Model Checkpoint
+    EarlyStopping = utils.EarlyStopping(patience=10, verbose=True, path='best.pt',mode='max',mlflow=True)
 
     if args.output_dir:
         utils.mkdir(args.output_dir)
@@ -465,9 +463,9 @@ def main(args):
             train_sampler.set_epoch(epoch)
         train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler, target_metric)
         lr_scheduler.step()
-        evaluate(model, criterion, data_loader_test, device=device)
+        evaluate(model, criterion, data_loader_test, device=device, target_metric=target_metric, EarlyStopping=None)
         if model_ema:
-            evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
+            evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA", target_metric=target_metric, EarlyStopping=EarlyStopping)
         if args.output_dir:
             checkpoint = {
                 "model": model_without_ddp.state_dict(),
