@@ -130,7 +130,7 @@ def evaluate(model, criterion, data_loader, device, epoch, print_freq=100, log_s
 
     if EarlyStopping:
         EarlyStopping(f1_score, model)
-    return metric_logger.f1.global_avg
+    return f1_score
 
 
 def _get_cache_path(filepath):
