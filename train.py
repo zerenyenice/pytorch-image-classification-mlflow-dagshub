@@ -124,9 +124,9 @@ def evaluate(model, criterion, data_loader, device, epoch, print_freq=100, log_s
 
     print(f"{header} Acc@1 {avg_acc1:.3f} F1 {f1_score:.3f}")
     target_metric.reset()
-    log_scalar("test_loss", avg_loss, epoch)
-    log_scalar("test_acc", avg_acc1, epoch)
-    log_scalar("test_f1", f1_score, epoch)
+    log_scalar(f"test{log_suffix}_loss", avg_loss, epoch)
+    log_scalar(f"test{log_suffix}_acc", avg_acc1, epoch)
+    log_scalar(f"test{log_suffix}_f1", f1_score, epoch)
 
     if EarlyStopping:
         EarlyStopping(f1_score, model)
